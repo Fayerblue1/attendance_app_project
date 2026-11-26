@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
 import '../services/auth_service.dart';
-import '../widgets/google_logo.dart';
 
 class LoginView extends StatefulWidget {
   final VoidCallback onSwitchToRegister;
@@ -15,11 +15,15 @@ class LoginView extends StatefulWidget {
 }
 
 class _LoginViewState extends State<LoginView> {
+  static const String _prefRememberMe = 'remember_me';
+  static const String _prefIdentifier = 'remembered_identifier';
+  static const String _prefRole = 'remembered_role';
+
   final AuthService _authService = AuthService();
   final TextEditingController _identifierController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
 
-  String _selectedRole = 'siswa'; // 'siswa' or 'guru'
+  String _selectedRole = 'siswa'; // 'siswa' atau 'guru'
   bool _obscurePassword = true;
   bool _rememberMe = true;
   bool _isLoading = false;
@@ -29,6 +33,7 @@ class _LoginViewState extends State<LoginView> {
   void initState() {
     super.initState();
     _identifierController.addListener(_checkFormat);
+    _loadRememberedLogin();
   }
 
   @override
@@ -37,6 +42,39 @@ class _LoginViewState extends State<LoginView> {
     _identifierController.dispose();
     _passwordController.dispose();
     super.dispose();
+  }
+
+  /// Memuat status 'Ingat saya', identitas, dan peran tersimpan
+  Future<void> _loadRememberedLogin() async {
+    final prefs = await SharedPreferences.getInstance();
+    final remember = prefs.getBool(_prefRememberMe) ?? true;
+    final savedIdentifier = prefs.getString(_prefIdentifier) ?? '';
+    final savedRole = prefs.getString(_prefRole);
+
+    if (!mounted) return;
+    setState(() {
+      _rememberMe = remember;
+      if (remember && savedIdentifier.isNotEmpty) {
+        _identifierController.text = savedIdentifier;
+      }
+      if (remember && (savedRole == 'siswa' || savedRole == 'guru')) {
+        _selectedRole = savedRole!;
+      }
+    });
+    _checkFormat();
+  }
+
+  /// Menyimpan atau menghapus identitas login berdasarkan checkbox 'Ingat saya'
+  Future<void> _saveRememberedLogin(String identifier) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_prefRememberMe, _rememberMe);
+    if (_rememberMe) {
+      await prefs.setString(_prefIdentifier, identifier.trim());
+      await prefs.setString(_prefRole, _selectedRole);
+    } else {
+      await prefs.remove(_prefIdentifier);
+      await prefs.remove(_prefRole);
+    }
   }
 
   void _checkFormat() {
@@ -54,7 +92,7 @@ class _LoginViewState extends State<LoginView> {
     }
   }
 
-Future<void> _handleLogin() async {
+  Future<void> _handleLogin() async {
     final identifier = _identifierController.text.trim();
     final password = _passwordController.text;
 
@@ -79,6 +117,10 @@ Future<void> _handleLogin() async {
         password: password,
         role: _selectedRole,
       );
+      
+      // Simpan preferensi Ingat Saya setelah berhasil masuk
+      await _saveRememberedLogin(identifier);
+
       isSigningIn.value = false;
       if (mounted) {
         _showSnackbar('Berhasil masuk ke PresensiKu!', isError: false);
@@ -88,7 +130,8 @@ Future<void> _handleLogin() async {
       String message = 'Terjadi kesalahan saat masuk.';
       if (e.code == 'wrong-role') {
         message =
-            e.message ?? 'Peran akun tidak sesuai dengan pilihan peran saat masuk.';
+            e.message ??
+            'Peran akun tidak sesuai dengan pilihan peran saat masuk.';
       } else if (e.code == 'user-not-found') {
         message =
             'Akun tidak ditemukan. Silakan periksa NIS/Email atau daftar baru.';
@@ -99,7 +142,8 @@ Future<void> _handleLogin() async {
       } else if (e.code == 'user-disabled') {
         message = 'Akun Anda dinonaktifkan oleh pihak sekolah.';
       } else if (e.code == 'too-many-requests') {
-        message = 'Terlalu banyak percobaan gagal. Silakan tunggu beberapa saat.';
+        message =
+            'Terlalu banyak percobaan gagal. Silakan tunggu beberapa saat.';
       } else if (e.message != null && e.message!.isNotEmpty) {
         message = e.message!;
       }
@@ -120,14 +164,16 @@ Future<void> _handleLogin() async {
   void _showSnackbar(String message, {bool isError = false}) {
     if (!mounted) return;
     final messenger =
-        rootScaffoldMessengerKey.currentState ?? ScaffoldMessenger.maybeOf(context);
+        rootScaffoldMessengerKey.currentState ??
+        ScaffoldMessenger.maybeOf(context);
     if (messenger == null) return;
 
     messenger.clearSnackBars();
     messenger.showSnackBar(
       SnackBar(
-        backgroundColor:
-            isError ? const Color(0xFFDC2626) : const Color(0xFF10B981),
+        backgroundColor: isError
+            ? const Color(0xFFDC2626)
+            : const Color(0xFF10B981),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 4),
         content: Row(
@@ -139,10 +185,7 @@ Future<void> _handleLogin() async {
             ),
             const SizedBox(width: 10),
             Expanded(
-              child: Text(
-                message,
-                style: const TextStyle(color: Colors.white),
-              ),
+              child: Text(message, style: const TextStyle(color: Colors.white)),
             ),
           ],
         ),
@@ -151,9 +194,12 @@ Future<void> _handleLogin() async {
   }
 
   void _showForgotPasswordSheet() {
+    final currentInput = _identifierController.text.trim();
     final resetController = TextEditingController(
-      text: _identifierController.text,
+      text: currentInput.contains('@') ? currentInput : '',
     );
+    String? errorText;
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -161,106 +207,117 @@ Future<void> _handleLogin() async {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
-      builder: (ctx) => Padding(
-        padding: EdgeInsets.only(
-          left: 24,
-          right: 24,
-          top: 24,
-          bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Center(
-              child: Container(
-                width: 48,
-                height: 5,
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade300,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-            ),
-            const SizedBox(height: 18),
-            const Text(
-              'Pemulihan Kata Sandi',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-                color: Color(0xFF0F172A),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Masukkan email yang terdaftar untuk menerima tautan pemulihan kata sandi.',
-              style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: resetController,
-              keyboardType: TextInputType.emailAddress,
-              decoration: InputDecoration(
-                prefixIcon: const Icon(
-                  Icons.email_outlined,
-                  color: Color(0xFF64748B),
-                ),
-                hintText: 'nama@student.sekolah.sch.id',
-                filled: true,
-                fillColor: const Color(0xFFF8FAFC),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF1D4ED8),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setModalState) => Padding(
+          padding: EdgeInsets.only(
+            left: 24,
+            right: 24,
+            top: 24,
+            bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 48,
+                  height: 5,
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade300,
+                    borderRadius: BorderRadius.circular(10),
                   ),
                 ),
-                onPressed: () async {
-                  final email = resetController.text.trim();
-                  if (email.isEmpty || !email.contains('@')) {
-                    _showSnackbar(
-                      'Masukkan alamat email yang valid.',
-                      isError: true,
-                    );
-                    return;
-                  }
-                  Navigator.pop(ctx);
-                  try {
-                    await _authService.sendPasswordReset(email);
-                    _showSnackbar(
-                      'Tautan pemulihan kata sandi telah dikirim ke $email',
-                    );
-                  } catch (e) {
-                    _showSnackbar(
-                      'Gagal mengirim email pemulihan: ${e.toString()}',
-                      isError: true,
-                    );
+              ),
+              const SizedBox(height: 18),
+              const Text(
+                'Pemulihan Kata Sandi',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF0F172A),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Masukkan alamat email akun yang terdaftar (bukan NIS/NIP) untuk menerima tautan reset kata sandi.',
+                style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: resetController,
+                keyboardType: TextInputType.emailAddress,
+                onChanged: (_) {
+                  if (errorText != null) {
+                    setModalState(() => errorText = null);
                   }
                 },
-                child: const Text(
-                  'Kirim Tautan Reset',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
+                decoration: InputDecoration(
+                  prefixIcon: const Icon(
+                    Icons.email_outlined,
+                    color: Color(0xFF64748B),
+                  ),
+                  hintText:
+                      'Masukkan email terdaftar (contoh: nama@sekolah.sch.id)',
+                  errorText: errorText,
+                  filled: true,
+                  fillColor: const Color(0xFFF8FAFC),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
                   ),
                 ),
               ),
-            ),
-          ],
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1D4ED8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  onPressed: () async {
+                    final email = resetController.text.trim();
+                    if (email.isEmpty ||
+                        !RegExp(
+                          r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',
+                        ).hasMatch(email)) {
+                      setModalState(() {
+                        errorText = 'Masukkan alamat email yang valid.';
+                      });
+                      return;
+                    }
+                    Navigator.pop(ctx);
+                    try {
+                      await _authService.sendPasswordReset(email);
+                      _showSnackbar(
+                        'Tautan pemulihan kata sandi telah dikirim ke $email',
+                      );
+                    } catch (e) {
+                      _showSnackbar(
+                        'Gagal mengirim email pemulihan: ${e.toString()}',
+                        isError: true,
+                      );
+                    }
+                  },
+                  child: const Text(
+                    'Kirim Tautan Reset',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -581,10 +638,17 @@ Future<void> _handleLogin() async {
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(4),
                     ),
-                    onChanged: (val) {
+                    onChanged: (val) async {
+                      final checked = val ?? false;
                       setState(() {
-                        _rememberMe = val ?? false;
+                        _rememberMe = checked;
                       });
+                      final prefs = await SharedPreferences.getInstance();
+                      await prefs.setBool(_prefRememberMe, checked);
+                      if (!checked) {
+                        await prefs.remove(_prefIdentifier);
+                        await prefs.remove(_prefRole);
+                      }
                     },
                   ),
                 ),
@@ -656,109 +720,6 @@ Future<void> _handleLogin() async {
                       ),
                     ],
                   ),
-          ),
-        ),
-        const SizedBox(height: 12),
-
-        // Biometric Button
-        SizedBox(
-          width: double.infinity,
-          height: 48,
-          child: OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              backgroundColor: const Color(0xFFF0FDF4),
-              side: const BorderSide(color: Color(0xFFBBF7D0)),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-              ),
-            ),
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'Sensor Biometrik diaktifkan. Tempelkan sidik jari pada sensor.',
-                  ),
-                  behavior: SnackBarBehavior.floating,
-                ),
-              );
-            },
-            child: const Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.fingerprint, color: Color(0xFF0D9488), size: 22),
-                SizedBox(width: 8),
-                Text(
-                  'Masuk Cepat Presensi Biometrik',
-                  style: TextStyle(
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w600,
-                    color: Color(0xFF0F766E),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 18),
-
-        // Divider
-        Row(
-          children: [
-            Expanded(child: Divider(color: Colors.grey.shade300, thickness: 1)),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Text(
-                'ATAU MASUK DENGAN',
-                style: TextStyle(
-                  fontSize: 10.5,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.grey.shade500,
-                  letterSpacing: 0.5,
-                ),
-              ),
-            ),
-            Expanded(child: Divider(color: Colors.grey.shade300, thickness: 1)),
-          ],
-        ),
-        const SizedBox(height: 16),
-
-        // Google Workspace for Education Button
-        SizedBox(
-          width: double.infinity,
-          height: 48,
-          child: OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              backgroundColor: Colors.white,
-              side: const BorderSide(color: Color(0xFFE2E8F0)),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-              ),
-            ),
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'Menghubungkan ke Google Workspace for Education...',
-                  ),
-                  behavior: SnackBarBehavior.floating,
-                ),
-              );
-            },
-            child: const Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                GoogleLogo(size: 20),
-                SizedBox(width: 10),
-                Text(
-                  'Google Workspace for Education',
-                  style: TextStyle(
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w600,
-                    color: Color(0xFF334155),
-                  ),
-                ),
-              ],
-            ),
           ),
         ),
         const SizedBox(height: 18),

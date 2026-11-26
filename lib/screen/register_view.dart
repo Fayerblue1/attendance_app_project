@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 import '../services/auth_service.dart';
-import '../widgets/google_logo.dart';
+// import '../widgets/google_logo.dart';
 
 class RegisterView extends StatefulWidget {
   final VoidCallback onSwitchToLogin;
@@ -771,68 +771,6 @@ class _RegisterViewState extends State<RegisterView> {
         ),
         const SizedBox(height: 18),
 
-        // Divider
-        Row(
-          children: [
-            Expanded(child: Divider(color: Colors.grey.shade300, thickness: 1)),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Text(
-                'ATAU DAFTAR DENGAN',
-                style: TextStyle(
-                  fontSize: 10.5,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.grey.shade500,
-                  letterSpacing: 0.5,
-                ),
-              ),
-            ),
-            Expanded(child: Divider(color: Colors.grey.shade300, thickness: 1)),
-          ],
-        ),
-        const SizedBox(height: 16),
-
-        // Google / Belajar.id Button
-        SizedBox(
-          width: double.infinity,
-          height: 48,
-          child: OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              backgroundColor: Colors.white,
-              side: const BorderSide(color: Color(0xFFE2E8F0)),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-              ),
-            ),
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'Menghubungkan ke Akun Belajar.id / Google Workspace...',
-                  ),
-                  behavior: SnackBarBehavior.floating,
-                ),
-              );
-            },
-            child: const Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                GoogleLogo(size: 20),
-                SizedBox(width: 10),
-                Text(
-                  'Akun Belajar.id / Google Workspace',
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: Color(0xFF334155),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 18),
-
         // Notice Box: Belum terdaftar di database sekolah?
         Container(
           padding: const EdgeInsets.all(14),
@@ -884,8 +822,7 @@ class _RegisterViewState extends State<RegisterView> {
             ],
           ),
         ),
-        const SizedBox(height: 22),
-
+        const SizedBox(height: 18),
         // Already have an account link
         Center(
           child: Wrap(

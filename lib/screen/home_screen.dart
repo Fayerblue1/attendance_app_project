@@ -980,6 +980,7 @@ class _HomeScreenState extends State<HomeScreen> {
       case 1:
         return HistoryPage(
           attendanceStream: _attendanceStream,
+          userProfile: _userProfile,
         );
       case 2:
         return LeaveRequestPage(
