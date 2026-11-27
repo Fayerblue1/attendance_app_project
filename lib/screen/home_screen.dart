@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../services/auth_service.dart';
+import '../services/location_helper.dart';
 import 'home_page.dart';
 import 'history_page.dart';
 import 'leave_request_page.dart';
@@ -32,6 +33,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // Stream Firestore yang diinisialisasi sekali agar tidak memicu re-subscribe
   Stream<QuerySnapshot>? _attendanceStream;
   Stream<QuerySnapshot>? _leaveRequestsStream;
+  Stream<QuerySnapshot>? _schedulesStream;
 
   // Attendance state for today
   bool _hasCheckedIn = false;
@@ -39,18 +41,30 @@ class _HomeScreenState extends State<HomeScreen> {
   String _checkInTime = '--:--';
   String _checkOutTime = '--:--';
   String _checkInStatus = 'Tepat Waktu';
+  // ignore: unused_field
   String _checkOutStatus = '';
 
-  // Monthly summary metrics
-  int _hadirCount = 18;
-  int _terlambatCount = 1;
-  int _izinSakitCount = 1;
+  // GPS & geofence state
+  int? _currentDistanceMeters;
+  bool _isWithinRadius = true;
+  String? _currentLocationName;
+
+  // Monthly summary metrics (dihitung dinamis dari Firestore & hari kerja bulan ini)
+  int _hadirCount = 0;
+  int _terlambatCount = 0;
+  int _izinSakitCount = 0;
   int _alpaCount = 0;
-  final int _totalHariEfektif = 20;
+  int _totalHariEfektif = 20;
 
   @override
   void initState() {
     super.initState();
+    _totalHariEfektif = _countWeekdaysInMonth(DateTime.now());
+    _schedulesStream = _firestore
+        .collection('class_schedules')
+        .where('weekday', isEqualTo: DateTime.now().weekday)
+        .snapshots();
+
     final user = _authService.currentUser;
     if (user != null) {
       _attendanceStream = _firestore
@@ -63,7 +77,39 @@ class _HomeScreenState extends State<HomeScreen> {
           .where('userId', isEqualTo: user.uid)
           .snapshots();
     }
+    _refreshCurrentLocation();
     _loadUserData();
+  }
+
+  Future<void> _refreshCurrentLocation() async {
+    try {
+      final loc = await LocationHelper.getAttendanceLocation();
+      if (mounted) {
+        setState(() {
+          _currentDistanceMeters = loc.distanceMeters;
+          _isWithinRadius = loc.withinRadius;
+          _currentLocationName = loc.locationName;
+        });
+      }
+    } catch (_) {
+      // Abaikan saat init jika izin/GPS belum aktif; akan dicegah saat tombol presensi ditekan
+    }
+  }
+
+  /// Menghitung jumlah hari Senin–Jumat pada bulan berjalan
+  int _countWeekdaysInMonth(DateTime referenceDate) {
+    final daysInMonth = DateUtils.getDaysInMonth(
+      referenceDate.year,
+      referenceDate.month,
+    );
+    int weekdays = 0;
+    for (int day = 1; day <= daysInMonth; day++) {
+      final date = DateTime(referenceDate.year, referenceDate.month, day);
+      if (date.weekday >= DateTime.monday && date.weekday <= DateTime.friday) {
+        weekdays++;
+      }
+    }
+    return weekdays > 0 ? weekdays : 20;
   }
 
   Future<void> _loadUserData() async {
@@ -81,7 +127,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
       var profile = await _authService.getUserProfile(user.uid);
       if (profile == null) {
-        // Wait 1.5s in case newly registered user document write is finishing
         await Future.delayed(const Duration(milliseconds: 1500));
         profile = await _authService.getUserProfile(user.uid);
       }
@@ -110,16 +155,17 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _evaluateCheckInStatus(DateTime now) {
-    // Batas masuk tepat waktu: 07:15 WIB
     final minutesOfDay = now.hour * 60 + now.minute;
     const deadlineMinutes = 7 * 60 + 15;
     return minutesOfDay > deadlineMinutes ? 'Terlambat' : 'Tepat Waktu';
   }
 
-  /// Load today's attendance and monthly statistics from Firestore
+  /// Memuat presensi hari ini & menghitung statistik bulan berjalan secara dinamis
   Future<void> _loadAttendanceSummary(String uid) async {
+    final now = DateTime.now();
     final dateStr = _getTodayDateStr();
     final monthPrefix = _getCurrentMonthPrefix();
+    final effectiveDays = _countWeekdaysInMonth(now);
 
     bool checkedIn = false;
     bool checkedOut = false;
@@ -128,16 +174,14 @@ class _HomeScreenState extends State<HomeScreen> {
     String inStatus = 'Tepat Waktu';
     String outStatus = '';
 
-    int hadir = 0;
-    int terlambat = 0;
-    int izinSakit = 0;
-    int alpa = 0;
-
     final Set<String> hadirDatesThisMonth = {};
     final Set<String> terlambatDatesThisMonth = {};
+    final Set<String> leaveDatesThisMonth = {};
+    final Set<String> alpaDatesThisMonth = {};
 
     try {
-      final todayDocRef = _firestore.collection('attendance').doc('${uid}_$dateStr');
+      final todayDocRef =
+          _firestore.collection('attendance').doc('${uid}_$dateStr');
       final todayDoc = await todayDocRef.get();
 
       if (todayDoc.exists && todayDoc.data() != null) {
@@ -154,12 +198,12 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
 
-      final query = await _firestore
+      final attendanceQuery = await _firestore
           .collection('attendance')
           .where('userId', isEqualTo: uid)
           .get();
 
-      for (final doc in query.docs) {
+      for (final doc in attendanceQuery.docs) {
         final data = doc.data();
         final docDate = (data['date'] as String?) ?? '';
 
@@ -178,7 +222,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
         if (docDate.startsWith(monthPrefix)) {
           final hasIn = data['checkInTime'] != null || data['type'] == 'masuk';
-          final status = ((data['checkInStatus'] ?? data['status'] ?? '') as String).toLowerCase();
+          final status =
+              ((data['checkInStatus'] ?? data['status'] ?? '') as String)
+                  .toLowerCase();
 
           if (hasIn) {
             if (status.contains('terlambat')) {
@@ -187,15 +233,31 @@ class _HomeScreenState extends State<HomeScreen> {
               hadirDatesThisMonth.add(docDate);
             }
           } else if (status.contains('izin') || status.contains('sakit')) {
-            izinSakit++;
-          } else if (status.contains('alpa')) {
-            alpa++;
+            leaveDatesThisMonth.add(docDate);
+          } else if (status.contains('alpa') ||
+              status.contains('tanpa keterangan')) {
+            alpaDatesThisMonth.add(docDate);
           }
         }
       }
 
-      hadir = hadirDatesThisMonth.isNotEmpty ? hadirDatesThisMonth.length : _hadirCount;
-      terlambat = terlambatDatesThisMonth.isNotEmpty ? terlambatDatesThisMonth.length : _terlambatCount;
+      final leaveQuery = await _firestore
+          .collection('leave_requests')
+          .where('userId', isEqualTo: uid)
+          .get();
+
+      for (final doc in leaveQuery.docs) {
+        final data = doc.data();
+        final docDate = (data['date'] as String?) ?? '';
+        final approvalStatus = ((data['status'] ?? '') as String).toLowerCase();
+
+        if (docDate.startsWith(monthPrefix) &&
+            !approvalStatus.contains('ditolak') &&
+            !approvalStatus.contains('rejected')) {
+          final keyDate = docDate.isNotEmpty ? docDate : doc.id;
+          leaveDatesThisMonth.add(keyDate);
+        }
+      }
 
       if (mounted) {
         setState(() {
@@ -205,10 +267,11 @@ class _HomeScreenState extends State<HomeScreen> {
           _checkOutTime = outTime;
           _checkInStatus = inStatus;
           _checkOutStatus = outStatus;
-          if (hadirDatesThisMonth.isNotEmpty) _hadirCount = hadir;
-          if (terlambatDatesThisMonth.isNotEmpty) _terlambatCount = terlambat;
-          if (izinSakit > 0) _izinSakitCount = izinSakit;
-          if (alpa > 0) _alpaCount = alpa;
+          _totalHariEfektif = effectiveDays;
+          _hadirCount = hadirDatesThisMonth.length;
+          _terlambatCount = terlambatDatesThisMonth.length;
+          _izinSakitCount = leaveDatesThisMonth.length;
+          _alpaCount = alpaDatesThisMonth.length;
         });
       }
     } catch (e) {
@@ -216,11 +279,14 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// CHECK IN & CHECK OUT DENGAN SISTEM PENCEGAHAN ABSENSI GANDA
+  /// CHECK IN & CHECK OUT DENGAN SISTEM PENCEGAHAN ABSENSI GANDA & GPS
   Future<void> _recordAttendance(String type) async {
     final user = _authService.currentUser;
     if (user == null) {
-      _showSnackbar('Silakan masuk terlebih dahulu untuk presensi.', isError: true);
+      _showSnackbar(
+        'Silakan masuk terlebih dahulu untuk presensi.',
+        isError: true,
+      );
       return;
     }
 
@@ -232,19 +298,42 @@ class _HomeScreenState extends State<HomeScreen> {
     final userName = (_userProfile?.name.isNotEmpty == true)
         ? _userProfile!.name
         : (user.displayName ?? 'Ahmad Rizky');
-    final userNis = (_userProfile?.nis.isNotEmpty == true) ? _userProfile!.nis : '210845';
-    final userClassId =
-        (_userProfile?.classId.isNotEmpty == true) ? _userProfile!.classId : 'XII MIPA 2';
+    final userNis =
+        (_userProfile?.nis.isNotEmpty == true) ? _userProfile!.nis : '210845';
+    final userClassId = (_userProfile?.classId.isNotEmpty == true)
+        ? _userProfile!.classId
+        : 'XII MIPA 2';
     final userRole = _userProfile?.role ?? 'siswa';
 
-    final docRef = _firestore.collection('attendance').doc('${user.uid}_$dateStr');
+    final docRef =
+        _firestore.collection('attendance').doc('${user.uid}_$dateStr');
 
     try {
+      final locResult = await LocationHelper.getAttendanceLocation();
+
+      if (mounted) {
+        setState(() {
+          _currentDistanceMeters = locResult.distanceMeters;
+          _isWithinRadius = locResult.withinRadius;
+          _currentLocationName = locResult.locationName;
+        });
+      }
+
+      // Aktifkan blok ini jika ingin menolak presensi di luar radius sekolah:
+      // if (!locResult.withinRadius) {
+      //   _showDuplicateAlert(
+      //     title: 'Di Luar Area Geofence!',
+      //     message:
+      //         'Jarak Anda saat ini ${locResult.distanceMeters} meter dari sekolah. Silakan mendekat ke area sekolah untuk presensi.',
+      //     isWarning: true,
+      //   );
+      //   return;
+      // }
+
       final docSnap = await docRef.get();
       final existingData = docSnap.exists ? docSnap.data() : null;
 
       if (type == 'masuk') {
-        // PENCEGAHAN ABSENSI MASUK GANDA
         if (existingData != null && existingData['checkInTime'] != null) {
           final recordedTime = existingData['checkInTime'];
           _showDuplicateAlert(
@@ -268,7 +357,10 @@ class _HomeScreenState extends State<HomeScreen> {
           'checkInTimestamp': FieldValue.serverTimestamp(),
           'checkInStatus': statusStr,
           'checkInLocation':
-              'SMK Negeri 1 Jakarta (Radius 42 meter • Geofence Valid)',
+              '${locResult.locationName} (Radius ${locResult.distanceMeters} meter)',
+          'distance': locResult.distanceMeters,
+          'latitude': locResult.latitude,
+          'longitude': locResult.longitude,
           'status': 'Hadir',
           'updatedAt': FieldValue.serverTimestamp(),
         }, SetOptions(merge: true));
@@ -283,7 +375,10 @@ class _HomeScreenState extends State<HomeScreen> {
           'date': dateStr,
           'time': timeStr,
           'status': statusStr,
-          'location': 'SMK Negeri 1 Jakarta (Kampus Pusat)',
+          'location': locResult.locationName,
+          'distance': locResult.distanceMeters,
+          'latitude': locResult.latitude,
+          'longitude': locResult.longitude,
           'timestamp': FieldValue.serverTimestamp(),
         });
 
@@ -292,10 +387,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _showSuccessDialog(
           title: 'Presensi Masuk Berhasil!',
           message:
-              'Kehadiran Anda telah dicatat pada pukul $timeStr WIB dengan status: $statusStr.\nLokasi terverifikasi di area sekolah (42m).',
+              'Kehadiran Anda telah dicatat pada pukul $timeStr WIB dengan status: $statusStr.\nLokasi terverifikasi di area sekolah (${locResult.distanceMeters}m).',
         );
       } else if (type == 'pulang') {
-        // CEK APAKAH SUDAH ABSEN MASUK DULU
         if (existingData == null || existingData['checkInTime'] == null) {
           _showDuplicateAlert(
             title: 'Belum Presensi Masuk!',
@@ -306,7 +400,6 @@ class _HomeScreenState extends State<HomeScreen> {
           return;
         }
 
-        // PENCEGAHAN ABSENSI PULANG GANDA
         if (existingData['checkOutTime'] != null) {
           final recordedOut = existingData['checkOutTime'];
           _showDuplicateAlert(
@@ -322,7 +415,10 @@ class _HomeScreenState extends State<HomeScreen> {
           'checkOutTimestamp': FieldValue.serverTimestamp(),
           'checkOutStatus': 'Pukul 15:30 (Tepat Waktu)',
           'checkOutLocation':
-              'SMK Negeri 1 Jakarta (Radius 38 meter • Geofence Valid)',
+              '${locResult.locationName} (Radius ${locResult.distanceMeters} meter)',
+          'distance': locResult.distanceMeters,
+          'latitude': locResult.latitude,
+          'longitude': locResult.longitude,
           'updatedAt': FieldValue.serverTimestamp(),
         });
 
@@ -336,7 +432,10 @@ class _HomeScreenState extends State<HomeScreen> {
           'date': dateStr,
           'time': timeStr,
           'status': 'Pulang Tepat Waktu',
-          'location': 'SMK Negeri 1 Jakarta (Kampus Pusat)',
+          'location': locResult.locationName,
+          'distance': locResult.distanceMeters,
+          'latitude': locResult.latitude,
+          'longitude': locResult.longitude,
           'timestamp': FieldValue.serverTimestamp(),
         });
 
@@ -366,30 +465,44 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Icon(
               isWarning ? Icons.warning_amber_rounded : Icons.shield_outlined,
-              color: isWarning ? const Color(0xFFF59E0B) : const Color(0xFF1D4ED8),
+              color: isWarning
+                  ? const Color(0xFFF59E0B)
+                  : const Color(0xFF1D4ED8),
               size: 26,
             ),
             const SizedBox(width: 10),
             Expanded(
               child: Text(
                 title,
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
           ],
         ),
         content: Text(
           message,
-          style: const TextStyle(fontSize: 13, color: Color(0xFF475569), height: 1.4),
+          style: const TextStyle(
+            fontSize: 13,
+            color: Color(0xFF475569),
+            height: 1.4,
+          ),
         ),
         actions: [
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF1D4ED8),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
             ),
             onPressed: () => Navigator.pop(ctx),
-            child: const Text('Mengerti', style: TextStyle(color: Colors.white)),
+            child: const Text(
+              'Mengerti',
+              style: TextStyle(color: Colors.white),
+            ),
           ),
         ],
       ),
@@ -404,243 +517,48 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 26),
-            SizedBox(width: 10),
-            Text('Presensi Berhasil', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const Icon(
+              Icons.check_circle_rounded,
+              color: Color(0xFF10B981),
+              size: 26,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
           ],
         ),
         content: Text(
           message,
-          style: const TextStyle(fontSize: 13, color: Color(0xFF334155), height: 1.4),
+          style: const TextStyle(
+            fontSize: 13,
+            color: Color(0xFF334155),
+            height: 1.4,
+          ),
         ),
         actions: [
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF10B981),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
             ),
             onPressed: () => Navigator.pop(ctx),
-            child: const Text('Selesai', style: TextStyle(color: Colors.white)),
+            child: const Text(
+              'Selesai',
+              style: TextStyle(color: Colors.white),
+            ),
           ),
         ],
-      ),
-    );
-  }
-
-  /// Dialog Presensi Mandiri / Foto Selfie & GPS
-  void _openSelfiePresensiDialog() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.white,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (ctx) => StatefulBuilder(
-        builder: (bottomCtx, setModalState) {
-          final now = DateTime.now();
-          final nowTime =
-              '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
-          return Padding(
-            padding: EdgeInsets.only(
-              left: 20,
-              right: 20,
-              top: 20,
-              bottom: MediaQuery.of(bottomCtx).viewInsets.bottom + 24,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Center(
-                  child: Container(
-                    width: 48,
-                    height: 5,
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade300,
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                const Text(
-                  'Presensi Mandiri: Foto Selfie & GPS',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
-                ),
-                const SizedBox(height: 6),
-                const Text(
-                  'Sistem mencocokkan wajah dan memvalidasi geolokasi GPS gerbang sekolah.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
-                ),
-                const SizedBox(height: 18),
-
-                Container(
-                  width: double.infinity,
-                  height: 220,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF0F172A),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: const Color(0xFF3B82F6), width: 2),
-                  ),
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Container(
-                            width: 100,
-                            height: 100,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white.withValues(alpha: 0.8), width: 2),
-                            ),
-                            child: const Center(
-                              child: Icon(Icons.face_retouching_natural_rounded,
-                                  size: 48, color: Colors.white70),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF10B981).withValues(alpha: 0.9),
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: const Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(Icons.check_circle, size: 12, color: Colors.white),
-                                SizedBox(width: 4),
-                                Text(
-                                  'Wajah Terdeteksi & Cocok',
-                                  style: TextStyle(fontSize: 10.5, color: Colors.white, fontWeight: FontWeight.bold),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                      Positioned(
-                        top: 12,
-                        left: 12,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.6),
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: Text(
-                            '$nowTime WIB',
-                            style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.w600),
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        bottom: 12,
-                        right: 12,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.6),
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: const Row(
-                            children: [
-                              Icon(Icons.gps_fixed, size: 12, color: Color(0xFF60A5FA)),
-                              SizedBox(width: 4),
-                              Text('GPS Valid (42m)',
-                                  style: TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.w600)),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 18),
-
-                Row(
-                  children: [
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _hasCheckedIn ? const Color(0xFF94A3B8) : const Color(0xFF1D4ED8),
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        ),
-                        onPressed: _hasCheckedIn
-                            ? () {
-                                Navigator.pop(ctx);
-                                _showDuplicateAlert(
-                                  title: 'Presensi Masuk Sudah Tercatat!',
-                                  message:
-                                      'Anda sudah melakukan Presensi Masuk hari ini pukul $_checkInTime WIB. Sistem mencegah absensi ganda!',
-                                );
-                              }
-                            : () async {
-                                Navigator.pop(ctx);
-                                await _recordAttendance('masuk');
-                              },
-                        icon: Icon(_hasCheckedIn ? Icons.lock : Icons.login_rounded, color: Colors.white, size: 18),
-                        label: Text(
-                          _hasCheckedIn ? 'Sudah Masuk' : 'Ambil Selfie Masuk',
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12.5),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: (!_hasCheckedIn || _hasCheckedOut)
-                              ? const Color(0xFF94A3B8)
-                              : const Color(0xFF0D9488),
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        ),
-                        onPressed: (!_hasCheckedIn)
-                            ? () {
-                                Navigator.pop(ctx);
-                                _showDuplicateAlert(
-                                  title: 'Belum Presensi Masuk!',
-                                  message:
-                                      'Harap lakukan Presensi Masuk terlebih dahulu sebelum melakukan Presensi Pulang.',
-                                  isWarning: true,
-                                );
-                              }
-                            : (_hasCheckedOut
-                                ? () {
-                                    Navigator.pop(ctx);
-                                    _showDuplicateAlert(
-                                      title: 'Presensi Pulang Sudah Tercatat!',
-                                      message:
-                                          'Anda sudah melakukan Presensi Pulang hari ini pukul $_checkOutTime WIB. Sistem mencegah absensi ganda!',
-                                    );
-                                  }
-                                : () async {
-                                    Navigator.pop(ctx);
-                                    await _recordAttendance('pulang');
-                                  }),
-                        icon: Icon(
-                          _hasCheckedOut ? Icons.check_circle : Icons.logout_rounded,
-                          color: Colors.white,
-                          size: 18,
-                        ),
-                        label: Text(
-                          _hasCheckedOut ? 'Sudah Pulang' : 'Ambil Selfie Pulang',
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12.5),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          );
-        },
       ),
     );
   }
@@ -649,7 +567,8 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        backgroundColor: isError ? const Color(0xFFDC2626) : const Color(0xFF1E293B),
+        backgroundColor:
+            isError ? const Color(0xFFDC2626) : const Color(0xFF1E293B),
         behavior: SnackBarBehavior.floating,
         content: Text(message),
       ),
@@ -662,22 +581,32 @@ class _HomeScreenState extends State<HomeScreen> {
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         title: const Text('Keluar dari PresensiKu?'),
-        content: const Text('Anda harus masuk kembali untuk mencatat presensi berikutnya.'),
+        content: const Text(
+          'Anda harus masuk kembali untuk mencatat presensi berikutnya.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
-            child: const Text('Batal', style: TextStyle(color: Color(0xFF64748B))),
+            child: const Text(
+              'Batal',
+              style: TextStyle(color: Color(0xFF64748B)),
+            ),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFFDC2626),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
             ),
             onPressed: () async {
               Navigator.pop(ctx);
               await _authService.signOut();
             },
-            child: const Text('Keluar', style: TextStyle(color: Colors.white)),
+            child: const Text(
+              'Keluar',
+              style: TextStyle(color: Colors.white),
+            ),
           ),
         ],
       ),
@@ -720,7 +649,11 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 16),
               const Text(
                 'Pengajuan Izin / Sakit',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF0F172A),
+                ),
               ),
               const SizedBox(height: 6),
               const Text(
@@ -736,9 +669,18 @@ class _HomeScreenState extends State<HomeScreen> {
                   border: OutlineInputBorder(),
                 ),
                 items: const [
-                  DropdownMenuItem(value: 'Sakit', child: Text('Sakit (Surat Dokter / Orang Tua)')),
-                  DropdownMenuItem(value: 'Izin', child: Text('Izin (Keperluan Keluarga)')),
-                  DropdownMenuItem(value: 'Dispensasi', child: Text('Dispensasi (Lomba / Kegiatan Sekolah)')),
+                  DropdownMenuItem(
+                    value: 'Sakit',
+                    child: Text('Sakit (Surat Dokter / Orang Tua)'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'Izin',
+                    child: Text('Izin (Keperluan Keluarga)'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'Dispensasi',
+                    child: Text('Dispensasi (Lomba / Kegiatan Sekolah)'),
+                  ),
                 ],
                 onChanged: (val) {
                   if (val != null) setModalState(() => category = val);
@@ -750,7 +692,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 maxLines: 3,
                 decoration: const InputDecoration(
                   labelText: 'Keterangan Alasan *',
-                  hintText: 'Contoh: Sakit demam tinggi beristirahat atas saran dokter...',
+                  hintText:
+                      'Contoh: Sakit demam tinggi beristirahat atas saran dokter...',
                   border: OutlineInputBorder(),
                   alignLabelWithHint: true,
                 ),
@@ -762,7 +705,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 decoration: BoxDecoration(
                   color: const Color(0xFFF1F5F9),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: const Color(0xFFCBD5E1), style: BorderStyle.solid),
+                  border: Border.all(
+                    color: const Color(0xFFCBD5E1),
+                    style: BorderStyle.solid,
+                  ),
                 ),
                 child: const Row(
                   children: [
@@ -771,7 +717,10 @@ class _HomeScreenState extends State<HomeScreen> {
                     Expanded(
                       child: Text(
                         'Lampirkan Dokumen (Surat Dokter / Foto Bukti)',
-                        style: TextStyle(fontSize: 12, color: Color(0xFF475569)),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFF475569),
+                        ),
                       ),
                     ),
                     Icon(Icons.upload_file, color: Color(0xFF1D4ED8), size: 20),
@@ -785,12 +734,17 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: ElevatedButton(
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF1D4ED8),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                   ),
                   onPressed: () async {
                     final reason = reasonController.text.trim();
                     if (reason.isEmpty) {
-                      _showSnackbar('Harap isi alasan pengajuan izin/sakit.', isError: true);
+                      _showSnackbar(
+                        'Harap isi alasan pengajuan izin/sakit.',
+                        isError: true,
+                      );
                       return;
                     }
                     Navigator.pop(ctx);
@@ -799,7 +753,8 @@ class _HomeScreenState extends State<HomeScreen> {
                     if (user != null) {
                       await _firestore.collection('leave_requests').add({
                         'userId': user.uid,
-                        'studentName': _userProfile?.name ?? user.displayName ?? '',
+                        'studentName':
+                            _userProfile?.name ?? user.displayName ?? '',
                         'nis': _userProfile?.nis ?? '',
                         'classId': _userProfile?.classId ?? '',
                         'category': category,
@@ -808,13 +763,19 @@ class _HomeScreenState extends State<HomeScreen> {
                         'status': 'Menunggu Verifikasi',
                         'timestamp': FieldValue.serverTimestamp(),
                       });
+                      await _loadAttendanceSummary(user.uid);
                     }
 
-                    _showSnackbar('Pengajuan $category berhasil dikirim untuk diverifikasi.');
+                    _showSnackbar(
+                      'Pengajuan $category berhasil dikirim untuk diverifikasi.',
+                    );
                   },
                   child: const Text(
                     'Kirim Pengajuan Izin',
-                    style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                 ),
               ),
@@ -933,7 +894,11 @@ class _HomeScreenState extends State<HomeScreen> {
           alignment: Alignment.center,
           children: [
             IconButton(
-              icon: const Icon(Icons.notifications_none_rounded, color: Color(0xFF334155), size: 23),
+              icon: const Icon(
+                Icons.notifications_none_rounded,
+                color: Color(0xFF334155),
+                size: 23,
+              ),
               onPressed: () {
                 _showSnackbar('Tidak ada notifikasi baru hari ini.');
               },
@@ -957,7 +922,7 @@ class _HomeScreenState extends State<HomeScreen> {
           child: GestureDetector(
             onTap: () {
               setState(() {
-                _selectedNavIndex = 3; // Switch to Profil tab
+                _selectedNavIndex = 3;
               });
             },
             child: Container(
@@ -1006,8 +971,11 @@ class _HomeScreenState extends State<HomeScreen> {
           izinSakitCount: _izinSakitCount,
           alpaCount: _alpaCount,
           totalHariEfektif: _totalHariEfektif,
+          currentDistanceMeters: _currentDistanceMeters,
+          isWithinRadius: _isWithinRadius,
+          currentLocationName: _currentLocationName,
+          schedulesStream: _schedulesStream,
           onRecordAttendance: _recordAttendance,
-          onOpenSelfieDialog: _openSelfiePresensiDialog,
           onOpenLeaveDialog: _showLeaveRequestDialog,
           onNavigateToHistory: () {
             setState(() => _selectedNavIndex = 1);
@@ -1086,10 +1054,28 @@ class _LiveServerClockCardState extends State<LiveServerClockCard> {
   }
 
   String _formatIndonesianDate(DateTime dt) {
-    const days = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+    const days = [
+      'Minggu',
+      'Senin',
+      'Selasa',
+      'Rabu',
+      'Kamis',
+      'Jumat',
+      'Sabtu',
+    ];
     const months = [
-      'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
-      'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'
+      'Januari',
+      'Februari',
+      'Maret',
+      'April',
+      'Mei',
+      'Juni',
+      'Juli',
+      'Agustus',
+      'September',
+      'Oktober',
+      'November',
+      'Desember',
     ];
     final dayName = days[dt.weekday % 7];
     final monthName = months[dt.month - 1];
@@ -1120,8 +1106,11 @@ class _LiveServerClockCardState extends State<LiveServerClockCard> {
                   color: const Color(0xFFDBEAFE),
                   borderRadius: BorderRadius.circular(10),
                 ),
-                child: const Icon(Icons.access_time_filled_rounded,
-                    color: Color(0xFF1D4ED8), size: 18),
+                child: const Icon(
+                  Icons.access_time_filled_rounded,
+                  color: Color(0xFF1D4ED8),
+                  size: 18,
+                ),
               ),
               const SizedBox(width: 10),
               Column(
@@ -1130,9 +1119,10 @@ class _LiveServerClockCardState extends State<LiveServerClockCard> {
                   const Text(
                     'Waktu Presensi Server',
                     style: TextStyle(
-                        fontSize: 10.5,
-                        color: Color(0xFF64748B),
-                        fontWeight: FontWeight.w500),
+                      fontSize: 10.5,
+                      color: Color(0xFF64748B),
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                   RichText(
                     text: TextSpan(
@@ -1164,9 +1154,10 @@ class _LiveServerClockCardState extends State<LiveServerClockCard> {
               const Text(
                 'Hari Ini',
                 style: TextStyle(
-                    fontSize: 10.5,
-                    color: Color(0xFF64748B),
-                    fontWeight: FontWeight.w500),
+                  fontSize: 10.5,
+                  color: Color(0xFF64748B),
+                  fontWeight: FontWeight.w500,
+                ),
               ),
               Text(
                 todayFormatted,
